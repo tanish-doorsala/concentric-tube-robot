@@ -1,246 +1,212 @@
-// Concentric Push-Pull Tube Robot — Closed Loop Control
-// Serial: 9600 baud, newline terminated
+// ─────────────────────────────────────────────────────────────
+// Linear (mm) + Rotary (deg) + Stepper (deg)
 //
-// Commands:
-//   R:<deg>   — rotation absolute
-//   L:<mm>    — linear absolute (now supports negative and positive travel)
-//   LR:<mm>   — linear RELATIVE (+ extends, - retracts)
-//   S:<deg>   — stepper twist absolute
-//   RKP/RKI/RKD/LKP/LKI/LKD:<val>  — live PID tuning
-//   HOME      — zero all encoders, return to 0,0,0
-//
-// Reports every 100ms:
-//   ENC:rot,lin,step|SP:rot,lin,step|OUT:rot,lin
+// Serial commands:
+//   L:<mm>   Linear position   e.g. L:25.4 ~ 1 inch
+//   R:<deg>  Rotary position   e.g. R:360
+//   S:<deg>  Stepper angle     e.g. S:360
+//   H        Home all axes
+// ─────────────────────────────────────────────────────────────
 
 #include <Encoder.h>
 #include <PID_v1.h>
+#include <AccelStepper.h>
 
-// ── Calibration ──────────────────────────────────────────────
-const float ENC_COUNTS_PER_DEG_ROT = 7.96;     // was 8.30
-const float ENC_COUNTS_PER_MM_LIN  = 79.26;    // ~2014 counts per inch
-const float MAX_EXTENSION_MM       = 76.2;     // 3 inches (keep)
-const float STEPPER_GEAR_RATIO     = 16.0;     // keep
-
-// Derived
-const float STEPS_PER_DEG = (200.0 * STEPPER_GEAR_RATIO) / 360.0;
-
-// ── Pins ─────────────────────────────────────────────────────
+// ── Pins ──────────────────────────────────────────────────────
 #define DIR_PIN   10
 #define STEP_PIN  11
-#define MOT_A1    12    // Linear motor
+#define MOT_A1    12
 #define MOT_A2    13
-#define MOT_B1     9    // Rotational motor
+#define MOT_B1     9
 #define MOT_B2     8
-#define ENA        5    // Linear PWM enable
-#define ENB        6    // Rotational PWM enable
+#define ENA        5
+#define ENB        6
 
-// ── Encoders ─────────────────────────────────────────────────
-Encoder encLin(2, 7);
-Encoder encRot(3, 4);
+// ── Encoders ──────────────────────────────────────────────────
+Encoder encLin(3, 4);
+Encoder encRot(2, 7);
 
-// ── PID ──────────────────────────────────────────────────────
-double encRot_val = 0, outRot = 0, spRot = 0;
-double encLin_val = 0, outLin = 0, spLin = 0;
+// ── Stepper ───────────────────────────────────────────────────
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
-double Kp_R = 0.10, Ki_R = 0.00, Kd_R = 0.00;
-double Kp_L = 0.30, Ki_L = 0.00, Kd_L = 0.00;
+const float STEPPER_GEAR_RATIO = 16.0;
+const float STEPS_PER_DEG      = (200.0 * STEPPER_GEAR_RATIO) / 360.0;
+const float MAX_STEPPER_DEG    = 360.0f;
+const float STEPPER_MAX_SPEED  = 800.0;
+const float STEPPER_ACCEL      = 400.0;
 
-PID pidRot(&encRot_val, &outRot, &spRot, Kp_R, Ki_R, Kd_R, DIRECT);
-PID pidLin(&encLin_val, &outLin, &spLin, Kp_L, Ki_L, Kd_L, DIRECT);
+// ── Calibration ───────────────────────────────────────────────
+const float ENC_COUNTS_PER_MM  = 1970.0 / 25.4f;
+const float ENC_COUNTS_PER_DEG = 7.9;
+const float MAX_EXTENSION_MM   = 76.2f;
+const float MAX_ROTATION_DEG   = 360.0f;
 
-// ── Stepper ──────────────────────────────────────────────────
-volatile bool     stepState     = false;
-volatile long     stepPos       = 0;
-long              stepTarget    = 0;
-bool              stepRunning   = false;
+// ── Linear PID ────────────────────────────────────────────────
+double linPos = 0, linTarget = 0, linOutput = 0;
+double linKp = 4.0, linKi = 0.5, linKd = 0.3;
+const double LIN_DEADBAND = 0.3;
+const int    LIN_PWM_MIN  = 45;
+const int    LIN_PWM_MAX  = 120;
+PID linPID(&linPos, &linOutput, &linTarget, linKp, linKi, linKd, DIRECT);
 
-// ── Deadzones ────────────────────────────────────────────────
-const int DZ_PWM = 10;   // min PWM to avoid stall hum
-const int DZ_ENC = 10;   // encoder window where motor stops
+// ── Rotary PID ────────────────────────────────────────────────
+double rotPos = 0, rotTarget = 0, rotOutput = 0;
+double rotKp = 6.0;
+double rotKi = 0.05;
+double rotKd = 0.4;
+const double ROT_DEADBAND = 1.5;
+const int ROT_PWM_MIN = 40; 
+const int    ROT_PWM_MAX  = 120;
+PID rotPID(&rotPos, &rotOutput, &rotTarget, rotKp, rotKi, rotKd, DIRECT);
 
-// ── Slew rate (PWM ramp) ─────────────────────────────────────
-const int SLEW_MAX = 8;  // max PWM change per loop (~8 per ms = smooth ramp)
-int lastPwmRot = 0;
-int lastPwmLin = 0;
-
-// ── Encoder spike filter ─────────────────────────────────────
-const long ENC_MAX_JUMP = 150;  // max plausible counts between reads
-double prevEncRot = 0;
-double prevEncLin = 0;
-
-// ── Serial ───────────────────────────────────────────────────
-String serialBuf = "";
-unsigned long lastReport = 0;
-
-
+// ── State ─────────────────────────────────────────────────────
+bool linMoving  = false;
+bool rotMoving  = false;
+bool stepMoving = false;
 
 // ─────────────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(9600);
-  Serial.println("CTR ready. Commands: R/L/LR/S:<val> | RKP..LKD:<val> | HOME");
- 
+  Serial.begin(115200);
 
-  pinMode(STEP_PIN, OUTPUT); pinMode(DIR_PIN, OUTPUT);
-  pinMode(ENA, OUTPUT);      pinMode(ENB, OUTPUT);
-  pinMode(MOT_A1, OUTPUT);   pinMode(MOT_A2, OUTPUT);
-  pinMode(MOT_B1, OUTPUT);   pinMode(MOT_B2, OUTPUT);
+  pinMode(MOT_A1, OUTPUT); pinMode(MOT_A2, OUTPUT); pinMode(ENA, OUTPUT);
+  pinMode(MOT_B1, OUTPUT); pinMode(MOT_B2, OUTPUT); pinMode(ENB, OUTPUT);
 
-  pidRot.SetOutputLimits(-180, 180); pidRot.SetMode(AUTOMATIC);
-  pidLin.SetOutputLimits(-180, 180); pidLin.SetMode(AUTOMATIC);
+  stopLinear(); stopRotary();
+  encLin.write(0); encRot.write(0);
 
-  // Timer1 for stepper (CTC, prescaler 8 → 0.5µs/tick)
-  noInterrupts();
-  TCCR1A = 0; TCCR1B = 0; TCNT1 = 0;
-  OCR1A = 400;
-  TCCR1B |= (1 << WGM12) | (1 << CS11);
-  interrupts();
+  linPID.SetOutputLimits(-LIN_PWM_MAX, LIN_PWM_MAX);
+  linPID.SetSampleTime(20);
+  linPID.SetMode(AUTOMATIC);
+
+  rotPID.SetOutputLimits(-ROT_PWM_MAX, ROT_PWM_MAX);
+  rotPID.SetSampleTime(20);
+  rotPID.SetMode(AUTOMATIC);
+
+
+  stepper.setMaxSpeed(STEPPER_MAX_SPEED);
+  stepper.setAcceleration(STEPPER_ACCEL);
+  stepper.setCurrentPosition(0);
+
+  Serial.println("Triple-axis ready.");
+  Serial.println("L:<mm>  R:<deg>  S:<deg>  H=home all");
 }
 
+// ─────────────────────────────────────────────────────────────
 void loop() {
-  readSerial();
-
-  // Read encoders with spike rejection
-  double rawRot = (double)encRot.read();
-  double rawLin = (double)encLin.read();
-
-  if (abs(rawRot - prevEncRot) > ENC_MAX_JUMP) {
-    encRot.write((long)prevEncRot);  // rewrite last-known-good value
-    rawRot = prevEncRot;
-  }
-  if (abs(rawLin - prevEncLin) > ENC_MAX_JUMP) {
-    encLin.write((long)prevEncLin);
-    rawLin = prevEncLin;
-  }
-  encRot_val = rawRot;  prevEncRot = rawRot;
-  encLin_val = rawLin;  prevEncLin = rawLin;
-
-  pidRot.SetTunings(Kp_R, Ki_R, Kd_R);
-  pidLin.SetTunings(Kp_L, Ki_L, Kd_L);
-  pidRot.Compute();
-  pidLin.Compute();
-
-  lastPwmRot = driveMotorRamped(MOT_B1, MOT_B2, ENB, outRot, encRot_val, spRot, lastPwmRot);
-  lastPwmLin = driveMotorRamped(MOT_A1, MOT_A2, ENA, outLin, encLin_val, spLin, lastPwmLin);
-
-  if (stepRunning && abs(stepPos - stepTarget) < 2) {
-    setStepperSpeed(0);
-    stepRunning = false;
-  }
-
-  if (millis() - lastReport >= 100) {
-    lastReport = millis();
-    Serial.print("ENC:"); Serial.print(encRot_val); Serial.print(",");
-    Serial.print(encLin_val); Serial.print(","); Serial.print(stepPos);
-    Serial.print("|SP:"); Serial.print(spRot); Serial.print(",");
-    Serial.print(spLin); Serial.print(","); Serial.print(stepTarget);
-    Serial.print("|OUT:"); Serial.print(outRot); Serial.print(",");
-    Serial.println(outLin); 
-  
-  }
+  handleSerial();
+  runLinear();
+  runRotary();
+  runStepper();
 }
 
-// ── Drive a DC motor with slew-rate limiting ─────────────────
-int driveMotorRamped(int fwd, int rev, int pwmPin, double output, double enc, double sp, int prevPwm) {
-  int targetPwm;
-  if (enc > sp - DZ_ENC && enc < sp + DZ_ENC) {
-    targetPwm = 0;
-  } else {
-    targetPwm = constrain((int)abs(output), DZ_PWM, 255);
-    if (output < 0) targetPwm = -targetPwm;  // encode direction in sign
-  }
+// ── Linear PID loop ───────────────────────────────────────────
+void runLinear() {
+  if (!linMoving) return;
 
-  // Slew-rate limit: ramp toward target
-  int diff = targetPwm - prevPwm;
-  if (diff > SLEW_MAX)       prevPwm += SLEW_MAX;
-  else if (diff < -SLEW_MAX) prevPwm -= SLEW_MAX;
-  else                        prevPwm = targetPwm;
+  linPos = (encLin.read() * -1.0f) / ENC_COUNTS_PER_MM;
+  double err = linTarget - linPos;
 
-  int pwmOut = abs(prevPwm);
-  if (pwmOut < DZ_PWM) pwmOut = 0;  // below threshold = off
-
-  digitalWrite(rev, prevPwm < 0 ? HIGH : LOW);
-  digitalWrite(fwd, prevPwm > 0 ? HIGH : LOW);
-  analogWrite(pwmPin, pwmOut);
-  return prevPwm;
-}
-
-// ── Stepper speed: -255 to 255, 0 = stop ─────────────────────
-void setStepperSpeed(int speed) {
-  if (speed == 0) { TIMSK1 &= ~(1 << OCIE1A); return; }
-  OCR1A = map(constrain(abs(speed), 1, 255), 1, 255, 1428, 400);
-  digitalWrite(DIR_PIN, speed > 0 ? HIGH : LOW);
-  TIMSK1 |= (1 << OCIE1A);
-}
-
-// ── Serial parser ─────────────────────────────────────────────
-void readSerial() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (serialBuf.length() > 0) { parseCommand(serialBuf); serialBuf = ""; }
-    } else {
-      serialBuf += c;
-    }
-  }
-}
-
-void parseCommand(String cmd) {
-  cmd.trim();
-
-  if (cmd == "HOME") {
-    encRot.write(0); encLin.write(0);
-    stepPos = 0; stepTarget = 0;
-    spRot = 0; spLin = 0;
-    setStepperSpeed(0);
-    Serial.println("HOME: zeroed.");
+  if (abs(err) <= LIN_DEADBAND) {
+    stopLinear();
+    linMoving = false;
+    Serial.print(">> LIN REACHED: ");
+    Serial.print(linPos, 2);
+    Serial.println(" mm");
     return;
   }
 
-  int start = 0;
-  while (start < (int)cmd.length()) {
-    int comma = cmd.indexOf(',', start);
-    String token = (comma == -1) ? cmd.substring(start) : cmd.substring(start, comma);
-    start = (comma == -1) ? cmd.length() : comma + 1;
-    token.trim();
+  linPID.Compute();
+  int pwm = constrain((int)abs(linOutput), LIN_PWM_MIN, LIN_PWM_MAX);
+  if (linOutput > 0) linExtend(pwm);
+  else               linRetract(pwm);
 
-    int colon = token.indexOf(':');
-    if (colon == -1) continue;
-    String key = token.substring(0, colon);
-    float  val = token.substring(colon + 1).toFloat();
+  Serial.print("L: ");
+  Serial.print(linPos, 2);
+  Serial.print("mm  Err:");
+  Serial.print(err, 2);
+  Serial.print("  PWM:");
+  Serial.println(pwm);
+}
 
-    if      (key == "R")   spRot = val * ENC_COUNTS_PER_DEG_ROT;
-    else if (key == "L") {
-      // absolute linear target in mm, allow both directions
-      float mm = constrain(val, -MAX_EXTENSION_MM, MAX_EXTENSION_MM);
-      spLin = mm * ENC_COUNTS_PER_MM_LIN;
-    }
-    else if (key == "LR") {
-      // relative linear move in mm, allow both directions
-      float newMM = (spLin / ENC_COUNTS_PER_MM_LIN) + val;
-      newMM = constrain(newMM, -MAX_EXTENSION_MM, MAX_EXTENSION_MM);
-      spLin = newMM * ENC_COUNTS_PER_MM_LIN;
-    }
-    else if (key == "S") {
-      stepTarget = (long)(val * STEPS_PER_DEG);
-      long err = stepTarget - stepPos;
-      if (abs(err) > 2) { stepRunning = true; setStepperSpeed(err > 0 ? 150 : -150); }
-    }
-    else if (key == "RKP") Kp_R = val;
-    else if (key == "RKI") Ki_R = val;
-    else if (key == "RKD") Kd_R = val;
-    else if (key == "LKP") Kp_L = val;
-    else if (key == "LKI") Ki_L = val;
-    else if (key == "LKD") Kd_L = val;
-    else { Serial.print("Unknown key: "); Serial.println(key); }
+// ── Rotary PID loop ───────────────────────────────────────────
+void runRotary() {
+  if (!rotMoving) return;
+
+  rotPos = encRot.read() / ENC_COUNTS_PER_DEG;
+  double err = rotTarget - rotPos;
+
+  if (abs(err) <= ROT_DEADBAND) {
+    stopRotary();
+    rotMoving = false;
+    Serial.print(">> ROT REACHED: ");
+    Serial.print(rotPos, 2);
+    Serial.println(" deg");
+    return;
+  }
+
+  rotPID.Compute();
+  int pwm = constrain((int)abs(rotOutput), ROT_PWM_MIN, ROT_PWM_MAX);
+  if (rotOutput > 0) rotForward(pwm);
+  else               rotBackward(pwm);
+
+  Serial.print("R: ");
+  Serial.print(rotPos, 2);
+  Serial.print("deg  Err:");
+  Serial.print(err, 2);
+  Serial.print("  PWM:");
+  Serial.println(pwm);
+}
+
+// ── Stepper loop ──────────────────────────────────────────────
+void runStepper() {
+  if (!stepMoving) return;
+
+  stepper.run();
+
+  if (stepper.distanceToGo() == 0) {
+    stepMoving = false;
+    float arrivedDeg = stepper.currentPosition() / STEPS_PER_DEG;
+    Serial.print(">> STEP REACHED: ");
+    Serial.print(arrivedDeg, 2);
+    Serial.println(" deg");
   }
 }
 
-// ── Stepper ISR ───────────────────────────────────────────────
-ISR(TIMER1_COMPA_vect) {
-  stepState = !stepState;
-  digitalWrite(STEP_PIN, stepState);
-  if (stepState) {
-    if (digitalRead(DIR_PIN) == HIGH) stepPos++;
-    else                              stepPos--;
+// ── Serial parser ─────────────────────────────────────────────
+void handleSerial() {
+  if (!Serial.available()) return;
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+
+  if (cmd.equalsIgnoreCase("H")) {
+    linTarget = 0; linMoving = true;
+    rotTarget = 0; rotMoving = true;
+    stepper.moveTo(0); stepMoving = true;
+    Serial.println(">> Homing all axes...");
+  }
+  else if (cmd.startsWith("L:") || cmd.startsWith("l:")) {
+    float mm = constrain(cmd.substring(2).toFloat(), 0, MAX_EXTENSION_MM);
+    linTarget = mm; linMoving = true;
+    Serial.print(">> Linear -> "); Serial.print(mm, 1); Serial.println(" mm");
+  }
+  else if (cmd.startsWith("R:") || cmd.startsWith("r:")) {
+    float deg = constrain(cmd.substring(2).toFloat(), -MAX_ROTATION_DEG, MAX_ROTATION_DEG);
+    rotTarget = deg; rotMoving = true;
+    Serial.print(">> Rotary -> "); Serial.print(deg, 1); Serial.println(" deg");
+  }
+  else if (cmd.startsWith("S:") || cmd.startsWith("s:")) {
+    float deg = constrain(cmd.substring(2).toFloat(), -MAX_STEPPER_DEG, MAX_STEPPER_DEG);
+    long targetSteps = (long)(deg * STEPS_PER_DEG);
+    stepper.moveTo(targetSteps); stepMoving = true;
+    Serial.print(">> Stepper -> "); Serial.print(deg, 1); Serial.println(" deg");
   }
 }
+
+// ── Motor helpers ─────────────────────────────────────────────
+void linExtend(int pwm)   { digitalWrite(MOT_A1,HIGH); digitalWrite(MOT_A2,LOW);  analogWrite(ENA, pwm); }
+void linRetract(int pwm)  { digitalWrite(MOT_A1,LOW);  digitalWrite(MOT_A2,HIGH); analogWrite(ENA, pwm); }
+void stopLinear()         { digitalWrite(MOT_A1,LOW);  digitalWrite(MOT_A2,LOW);  analogWrite(ENA, 0);   }
+
+void rotForward(int pwm)  { digitalWrite(MOT_B1,HIGH); digitalWrite(MOT_B2,LOW);  analogWrite(ENB, pwm); }
+void rotBackward(int pwm) { digitalWrite(MOT_B1,LOW);  digitalWrite(MOT_B2,HIGH); analogWrite(ENB, pwm); }
+void stopRotary()         { digitalWrite(MOT_B1,LOW);  digitalWrite(MOT_B2,LOW);  analogWrite(ENB, 0);   }
